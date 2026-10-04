@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from . import config, core, guard, llm
+from . import alias
 from .db import audit, get_conn, write_tx
 
 
@@ -1727,6 +1728,12 @@ def invoke(family_id: str, inputs: dict, actor: str, request_id: str | None = No
                  json.dumps(guard.storable_tokens(tokens), ensure_ascii=False),
                  json.dumps(actions, ensure_ascii=False, sort_keys=True),
                  json.dumps(output_actions, ensure_ascii=False)))
+            # 化名域关联：模型输入仍是上面落库的普通遮盖占位符（绝不改写），这里
+            # 只在同一写事务内为字段属于活动化名域的原值分配/复用别名并建立关联，
+            # 供授权后的跨请求聚合。代次在本写事务内读取，同请求不可能跨代。
+            alias_links = alias.assign_for_request(c, rid, tokens)
+        else:
+            alias_links = 0
         audit(actor, "invoke", "request", rid,
               f"family={family_id} version={hit_version_id} model={model_id} "
               f"input={inp_digest[:12]} output={out_digest[:12]}"
@@ -1735,7 +1742,8 @@ def invoke(family_id: str, inputs: dict, actor: str, request_id: str | None = No
               + (" authz=" + authz_snapshot.get("approval_id", "none")
                  if authz_snapshot.get("required") else "")
               + (f" guard=v{grs['version']} {guard_status} masked="
-                 f"{len(scan['tokens']) if scan else 0}" if grs else ""))
+                 f"{len(scan['tokens']) if scan else 0} alias_links={alias_links}"
+                 if grs else ""))
     return {
         "request_id": rid, "family_id": family_id, "version_id": hit_version_id,
         "model_id": model_id, "input_digest": inp_digest, "template_hash": v["content_hash"],

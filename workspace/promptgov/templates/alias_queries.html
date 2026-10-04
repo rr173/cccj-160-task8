@@ -1,0 +1,66 @@
+{% if flash %}<div class="flash">⚠ {{ flash }}</div>{% endif %}
+
+<div class="note">
+  <a href="/guard/aliases">← 化名域配置</a> ·
+  聚合任务<b>创建时固定代次集合</b>（每个域保存当前代次），执行只按保存代次读取，
+  执行期间换代/新写入不会混入结果。只有持有各域<b>有效授权</b>的分析师能创建/执行；
+  域停用后拒绝新查询，已完成的历史结果仍可按保存代次复查。结果仅含别名标签与计数。
+</div>
+
+<div class="grid g2">
+  <div class="card">
+    <h2>创建授权聚合查询</h2>
+    <form method="post" action="/ui/guard/alias-queries">
+      <label>分析师标识（须对所选各域持有有效授权）</label>
+      <input name="analyst" value="{{ analyst }}" placeholder="analyst-wang" required>
+      <label>纳入的化名域（逗号分隔 domain_id；留空＝全部活动域）</label>
+      <input name="domain_ids" placeholder="留空：全部活动域">
+      <table style="margin:6px 0">
+        <thead><tr><th></th><th>代码</th><th>名称</th><th>字段</th><th>当前代</th><th>状态</th></tr></thead>
+        <tbody>
+        {% for d in domains %}
+          <tr><td class="small">·</td>
+            <td class="small mono"><a href="/guard/aliases/{{ d.domain_id }}">{{ d.code }}</a></td>
+            <td class="small">{{ d.name }}</td>
+            <td class="small">{{ d.fields }}</td>
+            <td class="small">g{{ d.generation }}</td>
+            <td>{% if d.is_active %}<span class="badge b-active">active</span>
+              {% else %}<span class="badge b-revoked">disabled</span>{% endif %}</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      <label>模板族过滤（可选）</label>
+      <select name="family_id">
+        <option value="">全部模板族</option>
+        {% for f in families %}<option value="{{ f.family_id }}">{{ f.family_id }} · {{ f.name }}</option>{% endfor %}
+      </select>
+      <div class="row" style="margin-top:10px"><button>固定代次并执行</button></div>
+    </form>
+  </div>
+
+  <div class="card">
+    <h2>聚合任务{% if analyst %}（{{ analyst }}）{% endif %}</h2>
+    <form method="get" action="/guard/alias-queries" class="row">
+      <input name="analyst" value="{{ analyst }}" placeholder="按分析师过滤（可空）">
+      <button class="ghost">过滤</button>
+    </form>
+    {% if queries %}
+    <table style="margin-top:10px">
+      <thead><tr><th>任务</th><th>分析师</th><th>固定代次</th><th>状态</th><th>行数</th><th>创建</th></tr></thead>
+      <tbody>
+      {% for q in queries %}
+        <tr>
+          <td class="small"><a href="/guard/alias-queries/{{ q.query_id }}?analyst={{ q.analyst }}">
+            {{ q.query_id }}</a><div class="small mut">{{ q.family_id }}</div></td>
+          <td class="small">{{ q.analyst }}</td>
+          <td class="small">{{ q.pinned_text }}</td>
+          <td><span class="badge b-{{ q.status }}">{{ q.status }}</span></td>
+          <td class="small">{{ q.result_count }}</td>
+          <td class="small">{{ q.created_at }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}<p class="small mut">暂无聚合任务。</p>{% endif %}
+  </div>
+</div>

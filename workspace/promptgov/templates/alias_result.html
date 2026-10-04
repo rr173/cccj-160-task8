@@ -1,0 +1,57 @@
+{% if flash %}<div class="flash">⚠ {{ flash }}</div>{% endif %}
+
+<div class="note">
+  <a href="/guard/alias-queries?analyst={{ analyst }}">← 聚合任务列表</a> ·
+  本页是<b>授权后的跨请求聚合</b>视图：别名标签是化名，<b>不含原值、不含盲索引、
+  不含 request_id</b>，也不可据此离线枚举原值。统计严格按任务创建时固定的代次集合
+  计算；执行中发生的换代/停用/新写入不会混入。
+</div>
+
+<div class="card">
+  <h2>聚合任务 <span class="mono small">{{ q.query_id }}</span></h2>
+  <div class="kv">
+    <div>分析师</div><div>{{ q.analyst }}</div>
+    <div>模板族范围</div><div>{{ q.family_id }}</div>
+    <div>固定代次集合</div><div>
+      {% for p in pins %}<span class="chip">{{ p.code }} · g{{ p.generation }}</span> {% endfor %}
+    </div>
+    <div>状态</div><div><span class="badge b-{{ q.status }}">{{ q.status }}</span></div>
+    <div>结果行数</div><div>{{ q.result_count }}</div>
+    <div>创建/开始/完成</div><div class="small">{{ q.created_at }} →
+      {{ q.started_at }} → {{ q.finished_at }}</div>
+    {% if q.is_error %}<div>错误</div><div class="bad">{{ q.error_reason }}</div>{% endif %}
+  </div>
+  {% if q.is_pinned %}
+  <form method="post" action="/ui/guard/alias-queries/{{ q.query_id }}/run"
+        style="margin-top:10px">
+    <button>执行聚合（按已固定代次）</button>
+  </form>
+  {% endif %}
+</div>
+
+{% if q.is_done %}
+<div class="card" style="margin-top:16px">
+  <h2>聚合结果（仅别名标签与计数）</h2>
+  <table>
+    <thead><tr><th>化名</th><th>代次</th><th>请求数</th><th>出现次数</th>
+      <th>成功回执</th><th>失败回执</th><th>首次出现</th><th>最近出现</th></tr></thead>
+    <tbody>
+    {% for r in results %}
+      <tr>
+        <td><b class="mono">{{ r.alias_label }}</b></td>
+        <td class="small">g{{ r.generation }}</td>
+        <td>{{ r.request_count }}</td>
+        <td>{{ r.occurrence_count }}</td>
+        <td class="ok">{{ r.success_count }}</td>
+        <td class="{{ 'bad' if r.failure_count else 'mut' }}">{{ r.failure_count }}</td>
+        <td class="small">{{ r.first_seen_at }}</td>
+        <td class="small">{{ r.last_seen_at }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  <p class="small mut" style="margin-top:8px">
+    同域同代相同别名＝同一原值；不同域/不同代的别名之间不可相互推断。
+    本结果不提供下载（任何导出文件都不携带原值或可离线枚举摘要）。</p>
+</div>
+{% endif %}

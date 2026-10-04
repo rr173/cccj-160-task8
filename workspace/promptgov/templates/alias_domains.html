@@ -1,0 +1,72 @@
+{% if flash %}<div class="flash">⚠ {{ flash }}</div>{% endif %}
+
+<div class="note">
+  <b>化名域（Alias Domains）</b>：管理员为指定字段建立关联域后，同一原值在同一域
+  <b>同一代次</b>内始终得到相同别名，可在<b>授权后</b>做跨请求聚合；不同域派生材料
+  不同、不能相互推断。模型输入永远使用普通遮盖占位符，化名只出现在授权聚合结果里——
+  本页只显示域/代次/计数，<b>不显示别名、盲索引或盐</b>。域支持<b>换代</b>（新数据走
+  新代次，旧统计按保存代次继续）与<b>停用</b>（拒绝新查询与新分配，历史可复查）。
+</div>
+
+<div class="grid g2">
+  <div class="card">
+    <h2>化名域列表</h2>
+    {% if domains %}
+    <table>
+      <thead><tr><th>代码</th><th>名称</th><th>关联字段</th><th>当前代</th><th>别名/关联</th><th>状态</th></tr></thead>
+      <tbody>
+      {% for d in domains %}
+        <tr>
+          <td><a href="/guard/aliases/{{ d.domain_id }}"><b class="mono">{{ d.code }}</b></a>
+            <div class="small mut">{{ d.domain_id }}</div></td>
+          <td class="small">{{ d.name }}</td>
+          <td class="small">{{ d.fields }}</td>
+          <td class="small">g{{ d.current_generation }}<div class="mut">{{ d.generations }} 代</div></td>
+          <td class="small">{{ d.mappings }} / {{ d.links }}</td>
+          <td>{% if d.is_active %}<span class="badge b-active">active</span>
+            {% else %}<span class="badge b-revoked">disabled</span>{% endif %}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="mut">尚未配置化名域。</p>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <h2>新建化名域</h2>
+    <form method="post" action="/ui/guard/aliases">
+      <label>域代码（别名前缀，留空自动生成；大写字母/数字/下划线）</label>
+      <input name="code" placeholder="如 CUSTCONTACT">
+      <label>名称</label>
+      <input name="name" placeholder="如 客户联系方式关联域" required>
+      <label>关联字段（逗号分隔的契约顶层变量名；活动域字段不可重叠）</label>
+      <input name="fields" placeholder="customer_text, contact" required>
+      <label>别名槽位空间（每代次；碰撞线性探测上界，16~10000000）</label>
+      <input name="alias_slots" value="4096">
+      <label>备注</label>
+      <input name="note">
+      <div class="row" style="margin-top:10px"><button>创建并开启第 1 代</button></div>
+    </form>
+    <p class="small" style="margin-top:10px">
+      <a href="/guard/alias-queries">→ 授权聚合查询页</a></p>
+  </div>
+</div>
+
+<div class="card" style="margin-top:16px">
+  <h2>化名域审计流（无原值、无盲索引）</h2>
+  {% if audit %}
+  <table>
+    <thead><tr><th>时间</th><th>动作</th><th>操作人</th><th>明细</th></tr></thead>
+    <tbody>
+    {% for a in audit %}
+      <tr><td class="small">{{ a.created_at }}</td>
+        <td class="small mono">{{ a.action }}</td>
+        <td class="small">{{ a.actor }}</td>
+        <td class="small">{{ a.detail }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}<p class="small mut">暂无化名域审计。</p>{% endif %}
+</div>

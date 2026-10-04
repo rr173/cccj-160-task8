@@ -1011,9 +1011,15 @@ def verify_bytes(file_bytes: bytes) -> dict:
         if fx.get("ruleset_id") and not rec_of("guard_rulesets", fx["ruleset_id"]):
             _err(errors, "guard_fixture_ruleset_missing",
                  f"评估 {fx_id} 固定的规则版本不在包内（历史检查无法重建）")
-    # 禁止表绝不允许出现在包对象里（防篡改夹带密文/凭据/授权/还原审计/阻断日志）
+    # 禁止表绝不允许出现在包对象里（防篡改夹带密文/凭据/授权/还原审计/阻断日志；
+    # 化名域七表同理：盲索引/盐/别名映射/关联/授权/聚合任务与结果都不可导出，
+    # 聚合能力只存在于本实例的授权页面，下载文件不得携带任何可枚举摘要）。
     for forbidden in ("guard_secrets", "guard_credentials", "guard_reviewer_grants",
-                      "guard_reveals", "guard_block_log"):
+                      "guard_reveals", "guard_block_log",
+                      "guard_alias_domains", "guard_alias_generations",
+                      "guard_alias_mappings", "guard_alias_links",
+                      "guard_alias_grants", "guard_alias_queries",
+                      "guard_alias_results"):
         present = [k[1] for k in by_key if k[0] == forbidden]
         if present:
             _err(errors, "guard_forbidden_table_leak",

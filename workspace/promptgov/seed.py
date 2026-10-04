@@ -155,8 +155,46 @@ def run() -> None:
                      "lang": "zh", "channel": "app"}, actor,
                     request_id="seed-guard-masked-01")
 
+    # 化名域演示：为 customer_text 建关联域 CUSTCONTACT——模型输入仍是普通遮盖
+    # 占位符，化名只用于授权后的跨请求聚合；授权分析师 analyst-wang。造两条含
+    # 同一手机号（同一别名）与一条不同手机号（另一别名）的请求，化名聚合页可见
+    # 同一化名跨请求计数；域可换代/停用。
+    from . import alias
+    # 幂等：已有 CUSTCONTACT（无论活动/停用）则不重建；若同字段被其他（测试）
+    # 活动域占用，种子演示域跳过创建，避免破坏"活动域字段不相交"不变量。
+    all_domains = alias.list_domains()
+    existing = next((d for d in all_domains if d["code"] == "CUSTCONTACT"), None)
+    field_owner = next((d for d in all_domains
+                        if d["status"] == "active"
+                        and "customer_text" in d["fields"]
+                        and d["code"] != "CUSTCONTACT"), None)
+    if existing:
+        contact_domain = existing
+    elif field_owner:
+        contact_domain = None  # 字段被其他活动域占用（通常是测试库），跳过演示域
+    else:
+        contact_domain = alias.create_domain(
+            "客户原话关联域", ["customer_text"], actor, code="CUSTCONTACT",
+            note="演示：同域同原值同别名，跨域不可推断；模型输入仍用普通占位符",
+            alias_slots=4096)
+    if contact_domain is not None and contact_domain["status"] == "active":
+        alias.grant_analyst(contact_domain["domain_id"], "analyst-wang", actor,
+                            "客服跨请求关联分析")
+        services.invoke(FAMILY,
+                        {"customer_text": "问题已解决，回访电话 13812345678，好评",
+                         "lang": "zh", "channel": "app"}, actor,
+                        request_id="seed-alias-01")
+        services.invoke(FAMILY,
+                        {"customer_text": "还是同一个问题，联系电话 13812345678",
+                         "lang": "zh", "channel": "web"}, actor,
+                        request_id="seed-alias-02")
+        services.invoke(FAMILY,
+                        {"customer_text": "另一位客户，电话 13799998888",
+                         "lang": "zh", "channel": "app"}, actor,
+                        request_id="seed-alias-03")
+
     conn.commit()
     print("[seed] 演示数据就绪：family=%s 线上=v1，候选 v2（20%% 放量中，止损 3600s/"
           "n≥10/失败≤30%%，已入账 8 成功 2 失败）、v3（需工具权限审批）、"
           "v4（弱模型证据）；敏感隔离 v1（手机/邮箱替换、机密阻断，"
-          "复核人 auditor-li）" % FAMILY)
+          "复核人 auditor-li）；化名域 CUSTCONTACT（analyst-wang 可聚合）" % FAMILY)

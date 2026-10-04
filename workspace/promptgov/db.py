@@ -417,6 +417,128 @@ CREATE TABLE IF NOT EXISTS guard_eval_fixtures (
     created_at       TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- ============================================================ 化名域（Alias Domains）
+-- 管理员为指定**字段**建立关联域：同一原值在同一域同一代次内始终得到同一别名，
+-- 不同域之间派生材料不同、不能相互推断。别名仅用于**授权后的跨请求聚合**——
+-- 模型输入永远使用 Guard 的普通遮盖占位符；化名域任何表都不存原值，盲索引/槽位
+-- 均由主密钥+代次随机盐做 HMAC 派生（持库者无法离线枚举出"原值→别名"字典）。
+-- 全部七张表与密文/凭据同属证据包**禁止表**：任何导出/下载文件都不含其内容。
+CREATE TABLE IF NOT EXISTS guard_alias_domains (
+    domain_id        TEXT PRIMARY KEY,
+    code             TEXT NOT NULL UNIQUE,     -- 别名前缀代码（大写标识），如 CUSTCONTACT
+    name             TEXT NOT NULL,
+    fields_json      TEXT NOT NULL,            -- 关联字段（契约顶层变量名）数组
+    alias_slots      INTEGER NOT NULL,         -- 每代次别名槽位空间（碰撞线性探测上界）
+    current_generation INTEGER NOT NULL DEFAULT 1,
+    status           TEXT NOT NULL DEFAULT 'active', -- active / disabled（停用不可逆）
+    note             TEXT NOT NULL DEFAULT '',
+    created_by       TEXT NOT NULL DEFAULT 'api',
+    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    disabled_at      TEXT,
+    disabled_by      TEXT NOT NULL DEFAULT '',
+    disable_reason   TEXT NOT NULL DEFAULT ''
+);
+
+-- 化名代次：换代生成新随机盐并开新别名命名空间——新数据走新代次，旧映射与旧
+-- 统计按保存的代次（盐）继续计算，两代之间不可关联。
+CREATE TABLE IF NOT EXISTS guard_alias_generations (
+    generation_id    TEXT PRIMARY KEY,
+    domain_id        TEXT NOT NULL REFERENCES guard_alias_domains(domain_id),
+    generation       INTEGER NOT NULL,
+    salt             TEXT NOT NULL,            -- 本代 HMAC 盐（随机；不进任何导出）
+    status           TEXT NOT NULL DEFAULT 'current', -- current / superseded
+    created_by       TEXT NOT NULL DEFAULT 'api',
+    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(domain_id, generation)
+);
+
+-- 原值→别名映射（每域每代）：value_index 为主密钥键控盲索引（不可离线枚举），
+-- 别名槽位先按偏好散列取号、碰撞时线性探测改派；两个唯一约束共同保证并发首次
+-- 分配只产生一个映射，且已有映射的槽位永不改变。
+CREATE TABLE IF NOT EXISTS guard_alias_mappings (
+    alias_id         TEXT PRIMARY KEY,
+    domain_id        TEXT NOT NULL,
+    generation       INTEGER NOT NULL,
+    value_index      TEXT NOT NULL,            -- HMAC(主密钥, 域|代|盐|原值)，仅查询键
+    alias_slot       INTEGER NOT NULL,
+    alias_label      TEXT NOT NULL,            -- {CODE}-{slot:04d}，授权聚合中展示的化名
+    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(domain_id, generation, value_index),
+    UNIQUE(domain_id, generation, alias_slot)
+);
+
+-- 请求↔别名关联：一个被遮盖占位符命中且其字段属于某活动域时写一行；聚合按
+-- (域, 代次, 别名) 关联这些行。**不携带原值**，token 是普通遮盖占位符。
+CREATE TABLE IF NOT EXISTS guard_alias_links (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id       TEXT NOT NULL REFERENCES requests(request_id),
+    domain_id        TEXT NOT NULL,
+    generation       INTEGER NOT NULL,         -- 该请求分配别名时保存的代次
+    alias_id         TEXT NOT NULL REFERENCES guard_alias_mappings(alias_id),
+    field            TEXT NOT NULL,            -- 契约顶层变量名
+    path             TEXT NOT NULL,            -- 命中路径
+    token            TEXT NOT NULL,            -- 普通遮盖占位符（模型输入所用）
+    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(request_id, token)
+);
+
+-- 化名分析授权：哪些分析师可以对哪个域创建/执行聚合查询（可撤销，CAS）。
+CREATE TABLE IF NOT EXISTS guard_alias_grants (
+    grant_id         TEXT PRIMARY KEY,
+    domain_id        TEXT NOT NULL REFERENCES guard_alias_domains(domain_id),
+    analyst          TEXT NOT NULL,
+    granted_by       TEXT NOT NULL,
+    revoke_version   INTEGER NOT NULL DEFAULT 1,
+    revoked_at       TEXT,
+    revoked_by       TEXT NOT NULL DEFAULT '',
+    reason           TEXT NOT NULL DEFAULT '',
+    created_at       TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- 授权跨请求聚合任务：创建（pinned）瞬间在写事务内固定"域→代次"集合与授权
+-- 快照；执行按固定代次读取，执行中换代只产生新代次行，既被谓词排除又被只读
+-- 快照隔离，绝不混入半批新别名。
+CREATE TABLE IF NOT EXISTS guard_alias_queries (
+    query_id         TEXT PRIMARY KEY,
+    analyst          TEXT NOT NULL,
+    family_id        TEXT,                     -- NULL=跨全部模板族
+    domain_ids_json  TEXT NOT NULL,
+    pinned_json      TEXT NOT NULL,            -- [{domain_id,code,generation,generation_id}]
+    grant_ids_json   TEXT NOT NULL,            -- 创建时生效的授权 id 快照
+    status           TEXT NOT NULL DEFAULT 'pinned', -- pinned / running / done / error
+    error_reason     TEXT NOT NULL DEFAULT '',
+    result_count     INTEGER NOT NULL DEFAULT 0,
+    created_by       TEXT NOT NULL DEFAULT 'api',
+    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    started_at       TEXT,
+    finished_at      TEXT
+);
+
+-- 聚合结果：只有别名标签与计数/时间范围；无原值、无盲索引、无 request_id，
+-- 且仅能经授权查询页面读出。
+CREATE TABLE IF NOT EXISTS guard_alias_results (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    query_id         TEXT NOT NULL REFERENCES guard_alias_queries(query_id),
+    domain_id        TEXT NOT NULL,
+    generation       INTEGER NOT NULL,
+    alias_id         TEXT NOT NULL,
+    alias_label      TEXT NOT NULL,
+    request_count    INTEGER NOT NULL,
+    occurrence_count INTEGER NOT NULL,
+    success_count    INTEGER NOT NULL,
+    failure_count    INTEGER NOT NULL,
+    first_seen_at    TEXT NOT NULL,
+    last_seen_at     TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_alias_links_alias ON guard_alias_links(domain_id, generation, alias_id);
+CREATE INDEX IF NOT EXISTS idx_alias_links_request ON guard_alias_links(request_id);
+CREATE INDEX IF NOT EXISTS idx_alias_mappings_lookup
+    ON guard_alias_mappings(domain_id, generation, value_index);
+CREATE INDEX IF NOT EXISTS idx_alias_results_query ON guard_alias_results(query_id);
+CREATE INDEX IF NOT EXISTS idx_alias_grants_domain ON guard_alias_grants(domain_id);
+
 -- 证据包审计：每个实例各自记录本包在本地的导出/导入/校验/冲突事件
 -- （来源实例与导出切点保存在清单中，包内还固化了切点前的来源 audit_log）。
 CREATE TABLE IF NOT EXISTS evidence_audit (
