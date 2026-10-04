@@ -2,6 +2,7 @@
 
 <div class="note">
   <a href="/families/{{ family.family_id }}">← 返回 {{ family.name }}</a> ·
+  <a href="/families/{{ family.family_id }}/guard/aliases">化名域（授权跨请求聚合）→</a><br>
   敏感内容隔离规则按<b>模板族</b>配置，每次保存生成不可变<b>规则版本</b>；
   线上请求、评估回放、证据包复核共用同一确定版本。规则更新只影响<b>之后</b>的新请求，
   在途与历史请求永远按其固化版本与遮盖映射复核。被替换原值仅加密保存，

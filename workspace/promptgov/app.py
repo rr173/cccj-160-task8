@@ -9,7 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
-from . import config, evidence, guard, llm, services
+from . import aliases, config, evidence, guard, llm, services
 from .db import audit, get_conn, init_db
 from .jinja_compat import render_text
 
@@ -222,6 +222,14 @@ class Handler(BaseHTTPRequestHandler):
             code = 409
         elif isinstance(exc, guard.GuardDomain):
             code = 400
+        elif isinstance(exc, (aliases.AliasUnauthorized,)):
+            code = 403
+        elif isinstance(exc, (aliases.AliasConflict, aliases.AliasSpaceExhausted)):
+            code = 409
+        elif isinstance(exc, aliases.AliasNotFound):
+            code = 404
+        elif isinstance(exc, aliases.AliasDomainError):
+            code = 400
         elif isinstance(exc, services.NotFound):
             code = 404
         elif isinstance(exc, services.Conflict):
@@ -244,10 +252,13 @@ class Handler(BaseHTTPRequestHandler):
             self._route("GET")
         except Exception as exc:  # noqa: BLE001
             if getattr(self, "_is_page", False):
-                if isinstance(exc, services.NotFound):
+                if isinstance(exc, (services.NotFound, aliases.AliasNotFound)):
                     code = 404
-                elif isinstance(exc, (services.Conflict, services.DomainError)):
+                elif isinstance(exc, (services.Conflict, services.DomainError,
+                                     aliases.AliasConflict, aliases.AliasDomainError)):
                     code = 400
+                elif isinstance(exc, aliases.AliasUnauthorized):
+                    code = 403
                 else:
                     code = 500
                 self._html(page("出错", "error.html", {"message": str(exc),
@@ -286,6 +297,14 @@ class Handler(BaseHTTPRequestHandler):
         m = re.fullmatch(r"/families/([\w.-]+)", p)
         if method == "GET" and m:
             return self._page_family(m.group(1), q)
+        m = re.fullmatch(r"/families/([\w.-]+)/guard/aliases", p)
+        if method == "GET" and m:
+            return self._page_family_aliases(m.group(1), q)
+        if method == "GET" and p == "/aliases":
+            return self._page_aliases(q)
+        m = re.fullmatch(r"/alias/jobs/([\w.-]+)", p)
+        if method == "GET" and m:
+            return self._page_alias_job(m.group(1), q)
         m = re.fullmatch(r"/families/([\w.-]+)/guard", p)
         if method == "GET" and m:
             return self._page_family_guard(m.group(1), q)
@@ -382,6 +401,22 @@ class Handler(BaseHTTPRequestHandler):
             return self._ui_guard_issue(p.split("/")[-2])
         if method == "POST" and re.fullmatch(r"/ui/requests/[\w.-]+/reveal", p):
             return self._ui_guard_reveal(p.split("/")[-2])
+
+        # ------------------------------------------------ 化名域 UI 表单动作
+        if method == "POST" and re.fullmatch(r"/ui/families/[\w.-]+/alias-domains", p):
+            return self._ui_alias_create(p.split("/")[3])
+        if method == "POST" and re.fullmatch(r"/ui/alias-domains/[\w.-]+/rotate", p):
+            return self._ui_alias_rotate(p.split("/")[-2])
+        if method == "POST" and re.fullmatch(r"/ui/alias-domains/[\w.-]+/disable", p):
+            return self._ui_alias_disable(p.split("/")[-2])
+        if method == "POST" and re.fullmatch(r"/ui/alias-domains/[\w.-]+/grants", p):
+            return self._ui_alias_grant(p.split("/")[-2])
+        if method == "POST" and re.fullmatch(r"/ui/alias-grants/[\w.-]+/revoke", p):
+            return self._ui_alias_grant_revoke(p.split("/")[-2])
+        if method == "POST" and re.fullmatch(r"/ui/alias-domains/[\w.-]+/jobs", p):
+            return self._ui_alias_job(p.split("/")[-2])
+        if method == "POST" and re.fullmatch(r"/ui/alias-jobs/[\w.-]+/review", p):
+            return self._ui_alias_job_review(p.split("/")[-2])
 
         # ------------------------------------------------ JSON API
         if method == "GET" and p == "/api/models":
@@ -632,6 +667,79 @@ class Handler(BaseHTTPRequestHandler):
                 m.group(1), b["token"], b.get("actor", "api")), 200)
         if method == "GET" and p == "/api/guard/blocks":
             return self._json(guard.list_block_log(q.get("family", [None])[0]))
+
+        # ------------------------------------------------ 化名域（Alias Domains）JSON API
+        if method == "GET" and p == "/api/alias-domains":
+            fid = q.get("family", [None])[0]
+            return self._json(aliases.list_domains(fid))
+        m = re.fullmatch(r"/api/families/([\w.-]+)/alias-domains", p)
+        if method == "POST" and m:
+            b = _json_body(self)
+            fields = b.get("fields", [])
+            if isinstance(fields, str):
+                fields = [s.strip() for s in fields.split(",") if s.strip()]
+            return self._json(aliases.create_domain(
+                m.group(1), b["name"], fields, b.get("actor", "api"),
+                b.get("description", ""), b.get("alias_prefix"),
+                int(b["alias_space"]) if b.get("alias_space") else None), 201)
+        if method == "GET" and m:
+            return self._json(aliases.list_domains(m.group(1)))
+        m = re.fullmatch(r"/api/alias-domains/([\w.-]+)", p)
+        if method == "GET" and m:
+            return self._json(aliases.get_domain(m.group(1)))
+        m = re.fullmatch(r"/api/alias-domains/([\w.-]+)/rotate", p)
+        if method == "POST" and m:
+            b = _json_body(self)
+            exp = b.get("expected_gen")
+            return self._json(aliases.rotate_domain(
+                m.group(1), b.get("actor", "api"), b.get("note", ""),
+                int(exp) if exp is not None else None))
+        m = re.fullmatch(r"/api/alias-domains/([\w.-]+)/disable", p)
+        if method == "POST" and m:
+            b = _json_body(self)
+            if b.get("expected_version") is None:
+                raise aliases.AliasDomainError("必须提供 expected_version 做并发控制")
+            return self._json(aliases.disable_domain(
+                m.group(1), b.get("actor", "api"), int(b["expected_version"]),
+                b.get("reason", "")))
+        m = re.fullmatch(r"/api/alias-domains/([\w.-]+)/generations", p)
+        if method == "GET" and m:
+            return self._json(aliases.list_generations(m.group(1)))
+        m = re.fullmatch(r"/api/alias-domains/([\w.-]+)/grants", p)
+        if m:
+            if method == "GET":
+                return self._json(aliases.list_grants(m.group(1)))
+            b = _json_body(self)
+            return self._json(aliases.grant_analyst(
+                m.group(1), b["reviewer"], b.get("actor", "api"),
+                b.get("reason", "")), 201)
+        if method == "GET" and p == "/api/alias-grants":
+            return self._json(aliases.list_grants(None))
+        m = re.fullmatch(r"/api/alias-grants/([\w.-]+)/revoke", p)
+        if method == "POST" and m:
+            b = _json_body(self)
+            if b.get("expected_version") is None:
+                raise aliases.AliasDomainError("必须提供 expected_version 做并发控制")
+            return self._json(aliases.revoke_analyst(
+                m.group(1), int(b["expected_version"]), b.get("actor", "api"),
+                b.get("reason", "")))
+        m = re.fullmatch(r"/api/alias-domains/([\w.-]+)/jobs", p)
+        if method == "POST" and m:
+            b = _json_body(self)
+            return self._json(aliases.create_aggregation_job(
+                m.group(1), b["reviewer"], b.get("actor", b.get("reviewer", "api")),
+                b.get("window_from"), b.get("window_until"), b.get("note", "")), 201)
+        if method == "GET" and m:
+            return self._json(aliases.list_jobs(m.group(1)))
+        if method == "GET" and p == "/api/alias-jobs":
+            return self._json(aliases.list_jobs(q.get("domain", [None])[0]))
+        m = re.fullmatch(r"/api/alias-jobs/([\w.-]+)", p)
+        if method == "GET" and m:
+            return self._json(aliases.get_job(m.group(1)))
+        m = re.fullmatch(r"/api/alias-jobs/([\w.-]+)/review", p)
+        if method == "POST" and m:
+            b = _json_body(self)
+            return self._json(aliases.review_job(m.group(1)))
 
         # ------------------------------------------------ 证据包 JSON API
         return self._route_evidence(method, p, q)
@@ -1195,6 +1303,7 @@ class Handler(BaseHTTPRequestHandler):
                "feedback": feedback_card,
                "authz": _authz_card(authz),
                "guardcard": guard_card,
+               "aliascard": aliases.request_alias_summary(rid),
                "versions": versions, "models": llm.list_models(),
                "replays": rpl_rows, "result": None, "flash": self._flash(q)}
         # 若带 ?rpl= 则展示该报告详情
@@ -1731,6 +1840,170 @@ class Handler(BaseHTTPRequestHandler):
                "raw_inputs": json.dumps(res["raw_inputs"], ensure_ascii=False, indent=2)}
         self._html(page("原值还原结果（凭据已消费）", "guard_reveal.html", ctx))
 
+    # ============================================================ 化名域 UI 动作
+    def _ui_alias_create(self, fid):
+        self._is_page = True
+        f = _form(self)
+        fields = [s.strip() for s in f.get("fields", "").split(",") if s.strip()]
+        try:
+            d = aliases.create_domain(
+                fid, f["name"].strip(), fields, f.get("actor", "web") or "web",
+                f.get("description", ""), (f.get("alias_prefix", "").strip() or None),
+                int(f["alias_space"]) if f.get("alias_space", "").strip() else None)
+        except (aliases.AliasError, ValueError) as exc:
+            self._redirect(f"/families/{fid}/guard/aliases?err=" + quote(str(exc)[:200]))
+            return
+        self._redirect(f"/families/{fid}/guard/aliases#domain-{d['domain_id']}")
+
+    def _ui_alias_rotate(self, domain_id):
+        self._is_page = True
+        f = _form(self)
+        exp = f.get("expected_gen", "").strip()
+        d = aliases.rotate_domain(domain_id, f.get("actor", "web") or "web",
+                                  f.get("note", ""),
+                                  int(exp) if exp else None)
+        self._redirect(f"/families/{d['family_id']}/guard/aliases#domain-{domain_id}")
+
+    def _ui_alias_disable(self, domain_id):
+        self._is_page = True
+        f = _form(self)
+        d = aliases.disable_domain(domain_id, f.get("actor", "web") or "web",
+                                   int(f["expected_version"]), f.get("reason", ""))
+        self._redirect(f"/families/{d['family_id']}/guard/aliases#domain-{domain_id}")
+
+    def _ui_alias_grant(self, domain_id):
+        self._is_page = True
+        f = _form(self)
+        aliases.grant_analyst(domain_id, f["reviewer"].strip(),
+                              f.get("actor", "web") or "web", f.get("reason", ""))
+        self._redirect(f"/aliases?domain={domain_id}")
+
+    def _ui_alias_grant_revoke(self, grant_id):
+        self._is_page = True
+        f = _form(self)
+        g = aliases.revoke_analyst(grant_id, int(f["expected_version"]),
+                                   f.get("actor", "web") or "web", f.get("reason", ""))
+        self._redirect(f"/aliases?domain={g['domain_id']}")
+
+    def _ui_alias_job(self, domain_id):
+        self._is_page = True
+        f = _form(self)
+        try:
+            job = aliases.create_aggregation_job(
+                domain_id, f["reviewer"].strip(), f.get("actor", "web") or "web",
+                (f.get("window_from", "").strip() or None),
+                (f.get("window_until", "").strip() or None),
+                f.get("note", ""))
+        except aliases.AliasError as exc:
+            self._redirect(f"/aliases?domain={domain_id}&err=" + quote(str(exc)[:200]))
+            return
+        self._redirect(f"/alias/jobs/{job['job_id']}")
+
+    def _ui_alias_job_review(self, job_id):
+        self._is_page = True
+        f = _form(self)  # noqa: F841 - 复查无额外参数（表单按钮触发）
+        self._redirect(f"/alias/jobs/{job_id}?review=1")
+
+    # ============================================================ 化名域页面
+    def _alias_domain_card(self, d: dict) -> dict:
+        gens = aliases.list_generations(d["domain_id"])
+        counts = {c["generation_id"]: c["mapping_count"]
+                  for c in aliases.domain_mapping_counts(d["domain_id"])}
+        gen_rows = []
+        for g in gens:
+            gen_rows.append({"generation_id": g["generation_id"], "gen": g["gen"],
+                             "status": g["status"], "note": g["note"],
+                             "mapping_count": counts.get(g["generation_id"], 0),
+                             "created_by": g["created_by"], "created_at": g["created_at"],
+                             "retired_at": g["retired_at"] or ""})
+        grants = []
+        for g in aliases.list_grants(d["domain_id"]):
+            grants.append({"grant_id": g["grant_id"], "reviewer": g["reviewer"],
+                           "granted_by": g["granted_by"], "reason": g["reason"],
+                           "revoke_version": g["revoke_version"],
+                           "revoked": bool(g["revoked_at"]),
+                           "revoked_at": g["revoked_at"] or ""})
+        return {"domain_id": d["domain_id"], "family_id": d["family_id"], "name": d["name"],
+                "description": d["description"], "fields": d["fields"],
+                "fields_text": ", ".join(d["fields"]),
+                "status": d["status"], "disabled": d["status"] != "active",
+                "alias_space": d["alias_space"], "alias_prefix": d["alias_prefix"],
+                "current_gen": d["current_gen"], "revoke_version": d["revoke_version"],
+                "disabled_at": d["disabled_at"] or "", "created_by": d["created_by"],
+                "created_at": d["created_at"], "generations": gen_rows,
+                "grants": grants}
+
+    def _page_family_aliases(self, fid, q):
+        self._is_page = True
+        family = services.get_family(fid)
+        cards = [self._alias_domain_card(d)
+                 for d in aliases.list_domains(fid)]
+        ctx = {"family": family, "domains": cards, "has_domains": bool(cards),
+               "flash": self._flash(q)}
+        self._html(page(f"化名域 · {family['name']}", "alias_family.html", ctx))
+
+    def _page_aliases(self, q):
+        self._is_page = True
+        sel = q.get("domain", [None])[0]
+        domain = None
+        if sel:
+            domain = self._alias_domain_card(aliases.get_domain(sel))
+        cards = [self._alias_domain_card(d) for d in
+                 (aliases.list_domains(sel) if sel else aliases.list_domains(None))]
+        jobs = aliases.list_jobs(sel)
+        job_rows = []
+        for j in jobs:
+            job_rows.append({
+                "job_id": j["job_id"], "domain_id": j["domain_id"],
+                "domain_name": j["domain_name"], "created_by": j["created_by"],
+                "status": j["status"], "group_count": j["group_count"],
+                "occurrence_total": j["occurrence_total"],
+                "request_total": j["request_total"],
+                "current_gen": j["gen_snapshot"].get("current_gen"),
+                "window_from": j["window_from"] or "",
+                "window_until": j["window_until"] or "",
+                "note": j["note"], "created_at": j["created_at"]})
+        all_domains = [self._alias_domain_card(d)
+                       for d in aliases.list_domains(None)]
+        ctx = {"domains": cards, "all_domains": all_domains, "selected": domain,
+               "jobs": job_rows, "has_selected": bool(domain),
+               "flash": self._flash(q)}
+        self._html(page("授权跨请求聚合 · 化名域", "alias_query.html", ctx))
+
+    def _page_alias_job(self, job_id, q):
+        self._is_page = True
+        job = aliases.get_job(job_id)
+        review = None
+        if q.get("review"):
+            review = aliases.review_job(job_id)
+        d = job["domain"]
+        snap = job["gen_snapshot"]
+        gen_rows = [{"gen": g["gen"], "generation_id": g["generation_id"],
+                     "status": g["status"]} for g in snap.get("generations", [])]
+        groups = {}
+        for r in job["results"]:
+            groups.setdefault(r["gen"], []).append(r)
+        gen_groups = []
+        for gen in sorted(groups):
+            gen_groups.append({"gen": gen, "rows": groups[gen],
+                               "count": len(groups[gen])})
+        ctx = {"job": {"job_id": job["job_id"], "created_by": job["created_by"],
+                       "status": job["status"], "created_at": job["created_at"],
+                       "group_count": job["group_count"],
+                       "occurrence_total": job["occurrence_total"],
+                       "request_total": job["request_total"],
+                       "window_from": job["window_from"] or "（不限）",
+                       "window_until": job["window_until"] or "（不限）",
+                       "note": job["note"], "cutpoint": snap.get("cutpoint")},
+               "domain": {"domain_id": d["domain_id"], "name": d["name"],
+                          "family_id": d["family_id"], "status": d["status"],
+                          "alias_prefix": d["alias_prefix"]},
+               "snapshot_gen": snap.get("current_gen"),
+               "snapshot_generations": gen_rows,
+               "gen_groups": gen_groups,
+               "has_results": bool(job["results"]),
+               "review": review, "flash": self._flash(q)}
+        self._html(page("聚合结果 · 化名域", "alias_job.html", ctx))
 
 
 def _bump(semver: str) -> str:

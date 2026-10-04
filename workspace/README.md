@@ -227,11 +227,107 @@ v1.3.0（绑定弱模型 mini，评估 0.5 不达标）。
   申请凭据入口）；`/guard/audit` 全局逐请求隔离审计；包内复查/评估页同样展示
   固化版本与遮盖（只读、无还原）。
 
+## 化名域（授权后的跨请求关联聚合）
+
+在遮盖（Guard）**之上**叠加一层"关联域"，让授权分析人能在**看不到原值**的
+前提下做跨请求统计：管理员为指定字段创建化名域后，被遮盖原值在域内按
+**代次（generation）**分配**随机、不透明、不可离线枚举**的别名；同一原值在
+同一域同一代次内始终得到同一别名，**不同域独立取盐、别名之间不能相互推断**。
+
+关键边界（严格区分"遮盖给模型"与"化名人聚合"）：
+
+- **模型输入永远只用普通遮盖占位符**（`⟦PHONE#001⟧`）；别名**不进入**
+  `requests`、遮盖映射、渲染提示、输出、逐请求复查页或任何普通查询结果。
+- 别名只出现在**授权聚合任务结果**与化名映射表（原实例内）；审计明细只记录
+  域/代次/不同别名槽/出现次数，**不含原值也不含别名值**。
+- 化名全套表（域/代次/映射/逐请求落点/授权/任务/结果）**绝不进入证据包与
+  下载文件**（与 `guard_secrets` 同级禁止；落库校验把夹带这些表一律 422 拒绝），
+  任何下载/审计都不携带原值或可离线枚举的摘要。
+
+### 域配置 / 换代 / 停用
+
+- **域配置**：`POST .../alias-domains {name, fields, alias_prefix?, alias_space?}`
+  按**模板族**建域并开启第 1 代（代次随机盐）。`fields` 为关联的顶层字段
+  （`*` = 全部被遮盖字段）；建议同时被某条 mask 规则覆盖——化名只分配给
+  **被遮盖**的原值。别名 = 前缀 + 定宽 base36 码，码空间默认 2²⁰
+  （`alias_space` 可调小用于碰撞验证）。族内域名唯一。
+- **换代**：`POST .../rotate {expected_gen?, note?}` 生成新代次盐，旧代次置
+  `retired`。**换代后新请求/新映射只进新代次**；旧映射保留、旧统计永远按任务
+  保存的代次集合计算（不重写、不跨代并组）。换代带代次 CAS，两人并发换代
+  后到者 409。
+- **停用**：`POST .../disable {expected_version, reason?}`（配置版本号 CAS，
+  终态）。停用后**拒绝一切新聚合查询（409）**、invoke 不再为其分配别名；
+  历史映射、代次、任务与结果全部保留可复查，不提供重新启用。
+
+### 并发首次分配与哈希碰撞
+
+- **只产生一个映射**：映射以 `(域, 代次, 去重HMAC)` 为唯一键，全部在
+  `BEGIN IMMEDIATE` 写锁事务内分配；多人同时为首次出现的原值分配时，后到事务
+  复用先提交者的别名（48 线程压测：12 原值 × 4 并发只产生 12 个映射，同原值
+  4 线程拿到同一别名）。
+- 去重指纹 = `HMAC-SHA256(代次随机盐, "dedup"|原值)`、首选槽位 =
+  `HMAC(代次盐,"slot"|原值) mod 码空间`。随机盐键控使库外无法对手机号/字典空间
+  做离线枚举；换代换盐，新旧指纹天然不可关联。
+- **碰撞稳定改派**：两原值首选槽位相同（哈希碰撞）时，后到者确定性**线性探测**
+  下一个空闲码位；已有映射在任何情况下都不被改写（重取原原值仍是原别名）。
+  码空间用尽抛 `AliasSpaceExhausted`（换代后恢复），不会退回复用旧码或半写状态。
+
+### 授权聚合（固定代次集合，换代不混入半批）
+
+- **授权**：分析人须持有该域未撤销的 `alias_domain_grants`（可按版本号 CAS
+  撤销）；无授权/授权撤销发起聚合返回 403。停用域即便授权有效也拒绝（409）。
+- **固定代次集合**：`POST .../jobs {reviewer, window_from?, window_until?, note?}`
+  在单个只读**快照事务**（WAL 同一 read mark）内标定"查询开始时的代次集合"
+  （当前代次及全部历史代次）并完成全部聚合读取；任务创建期间发生换代、写入
+  新代次数据，本任务**看不到、不混入半批新别名**。快照后结果在独立写事务落库。
+- **结果只含别名与计数**：按 `(保存代次, 别名)` 分组输出
+  `occurrence_count / request_count / first_seen_at / last_seen_at`，可带半开
+  时间窗 `[window_from, window_until)`（按请求产生时间）；结果不含原值、去重
+  HMAC 或任何可反推原值的摘要。
+- **历史统计复查**：`POST .../jobs/{id}/review` 按任务**保存的代次集合与时间窗**
+  在当前库重算并与落库结果逐组比对——换代后重算只统计保存代次，新代次别名不
+  参与，旧结果逐组一致（`match=true`）或给出差异明细。
+- **跨域隔离**：同一原值在两个域的别名前缀不同、集合不相交（独立盐），无法由
+  一个域的别名推断另一个域或原值。
+
+### 页面与 JSON API
+
+- `/families/{id}/guard/aliases` **域配置页**：建域（字段/前缀/码空间）、代次
+  历史与各代已有别名数、换代（CAS）、停用（CAS）、聚合分析人授权/撤销。
+- `/aliases[?domain=]` **授权查询页**：选择域、发起授权聚合（分析人/时间窗）、
+  该域/全部域的任务历史（固定代次、分组数、总出现/请求数）。
+- `/alias/jobs/{id}` **聚合结果页**：任务固定的代次集合与切点、按代次分组的
+  别名→计数、"按保存代次复查"按钮与逐组一致/差异结论。
+- `/requests/{id}/replay` 增加**化名域落点**面板：仅域/固定代次/不同槽/出现
+  次数，**不显示别名值**（跨请求关联只能走授权聚合页）。
+
+```
+# —— 化名域 ——
+GET  /api/alias-domains[?family=]          # 域列表
+POST /api/families/{fid}/alias-domains     # {name, fields, alias_prefix?, alias_space?}
+GET  /api/families/{fid}/alias-domains
+GET  /api/alias-domains/{id}
+POST /api/alias-domains/{id}/rotate        # {expected_gen?, note?} 换代（CAS）
+POST /api/alias-domains/{id}/disable       # {expected_version, reason?} 停用（CAS）
+GET  /api/alias-domains/{id}/generations   # 代次历史（不含盐）
+GET  /api/alias-domains/{id}/grants
+POST /api/alias-domains/{id}/grants        # {reviewer, reason?} 授权分析人
+GET  /api/alias-grants
+POST /api/alias-grants/{gid}/revoke        # {expected_version, reason?}
+POST /api/alias-domains/{id}/jobs          # {reviewer, window_from?, window_until?, note?}
+GET  /api/alias-domains/{id}/jobs
+GET  /api/alias-jobs[?domain=]
+GET  /api/alias-jobs/{id}                  # 任务 + 结果（别名与计数）
+POST /api/alias-jobs/{id}/review           # 按保存代次集合重算比对
+```
+
 ## 页面
 
 - `/` 总览：模板族/线上版本（含放量中标记）、模型注册表、审计流。
 - `/families/{id}` 版本治理：建版本（四要素）、热发布/回滚、线上调用（可带 routing_key）、最近请求。
 - `/families/{id}/guard` **敏感隔离页**：规则版本配置、隔离预览、复核人授权/撤销、阻断记录、版本历史。
+- `/families/{id}/guard/aliases` **化名域配置页**：建域（关联字段/别名前缀/码空间）、代次历史、换代（CAS）、停用（CAS）、聚合分析人授权/撤销。
+- `/aliases` **授权聚合查询页**：选择化名域、发起授权聚合（分析人/时间窗）、任务历史；`/alias/jobs/{id}` **聚合结果页**（固定代次集合、按代次分组的别名→计数、按保存代次复查）。
 - `/guard/audit` **敏感隔离逐请求审计**：凭据签发/还原/拒绝（未授权/过期/重复/令牌错误）、阻断记录。
 - `/families/{id}/rollout` **放量操作页**：建批次、升档/冻结/恢复/完成/撤销、批次历史、最近命中。
 - `/rollouts/{id}/stoploss` **自动止损页**：止损配置、实时窗口统计、人工恢复、
@@ -281,7 +377,16 @@ v1.3.0（绑定弱模型 mini，评估 0.5 不达标）。
 | 还原单次短期 | 凭据绑定请求+复核人、TTL、库中只存令牌哈希；行守卫消费后才解密；未授权/撤销/过期/错令牌/重复均不暴露，并发恰好成功一次 |
 | 重复请求同一遮盖 | 同 request_id 返回同一遮盖结果（idempotent，不重新推理）；同 id 换输入 409；重复阻断同一 403 |
 | 证据包无还原能力 | 包只含规则版本/遮盖映射/评估回放；密文/凭据/授权/还原审计/阻断日志禁止入包，导入侧只做哈希历史检查 |
-| 审计 | 所有生命周期动作写 `audit_log`（总览页可见）；隔离还原每次尝试（含拒绝）写 `guard_reveals` |
+| 化名同域关联 | 原值→别名按 (域,代次,HMAC(代次盐,原值)) 唯一；同原值同代次恒同别名；随机盐键控不可离线枚举 |
+| 化名跨域隔离 | 每域每代次独立随机盐；同原值跨域别名不相交、不可互推；结果只含别名+计数 |
+| 模型只见占位符 | 别名不进 requests/遮盖映射/提示/输出/逐请求页；仅授权聚合任务结果可见别名 |
+| 并发首次分配 | 写锁事务 + (域,代次,dedup_hmac) 唯一；多人并发只产生一个映射，后到者复用先到别名 |
+| 碰撞稳定改派 | 首选码位=HMAC(盐,原值) mod 空间；碰撞线性探测下一空码，已有映射永不改变；用尽报错不半写 |
+| 换代固定代次 | 换代另开随机盐代次，新数据进新代；聚合任务在只读快照内固定开始时代次集合，执行中换代不混半批 |
+| 停用拒绝新查询 | 域停用（CAS 终态）后新聚合 409、新请求不分配别名；映射/任务/结果保留复查 |
+| 化名表禁入包 | alias_domains/generations/mappings/request_aliases/grants/jobs/results 全套禁止进证据包/下载 |
+| 历史统计复查 | review 按任务保存代次集合+时间窗重算逐组比对，新代次数据不参与旧结果 |
+| 审计 | 所有生命周期动作写 `audit_log`（总览页可见）；隔离还原每次尝试（含拒绝）写 `guard_reveals`；化名审计只记域/代次/计数，不含原值或别名值 |
 
 发布门禁（单事务内全部满足才翻指针）：
 1. 存在 `passed` 评估证据，且证据模型 = 版本绑定模型、通过率 ≥ 门槛（默认 1.0）；
@@ -392,7 +497,9 @@ POST /api/evidence/imports/{iid}/abort
 - `db.py`：SQLite schema（含 `rollouts` 批次表、`requests` 放量证据列与
   `authz_snapshot_json` 授权快照列、`approvals` 的有效期/撤销版本列，
   `stoploss_configs/windows/triggers/feedback_receipts` 止损四表，以及证据包
-  `evidence_packs/evidence_imports/evidence_audit` 归档表与 `app_meta` 实例元数据）、
+  `evidence_packs/evidence_imports/evidence_audit` 归档表与 `app_meta` 实例元数据，
+  化名域 `alias_domains/alias_generations/alias_mappings/guard_request_aliases/
+  alias_domain_grants/alias_jobs/alias_job_results` 七表）、
   WAL、`write_tx()` 立即写锁事务、`snapshot_tx()` 稳定切点只读快照事务、审计、
   老库增量迁移。
 - `core.py`：内容/输入/输出哈希、参数指纹、放量稳定散列分桶、变量契约校验与升级分级、
@@ -401,6 +508,10 @@ POST /api/evidence/imports/{iid}/abort
   （regex/keyword、字段作用域、阻断优先、确定性遮盖）、带认证对称加密与主密钥
   管理、规则版本治理（不可变版本/族唯一指针/CAS 生效）、复核人授权（可撤销）、
   短期单次绑定请求的还原凭据（行守卫消费、拒绝审计回滚后独立落库）。
+- `aliases.py`：化名域——域配置/换代/停用（代次随机盐、CAS）、原值→别名映射
+  （HMAC 去重/槽位、并发首次分配唯一、碰撞线性改派不动既有映射）、invoke 逐请求
+  落点、聚合分析人授权（可撤销）、只读快照内固定代次集合的授权聚合任务与结果、
+  按保存代次集合的历史复查。
 - `jinja_compat.py`：零依赖沙箱模板（`{{ }}`、`{% if/for %}`、过滤器、比较/三元）。
 - `llm.py`：模型注册表 + 确定性假模型（输出由 model/template/input 三轴决定）+ 断言器。
 - `services.py`：版本生命周期、评估证据（含隔离规则固定与逐用例遮盖/阻断）、审批、
@@ -421,6 +532,12 @@ POST /api/evidence/imports/{iid}/abort
   8 路并发还原恰好一次、评估固定版本与阻断用例、证据包族/窄范围携带规则版本但
   绝无密文/凭据、导入空实例哈希历史检查、篡改规则对象即拒、JSON API（403/409）
   与页面冒烟。
+- `tests/test_aliases.py`：化名域端到端验证——同域同原值恒同别名而模型输入只见
+  占位符、原值/别名不进 requests/审计/证据包、跨域别名不相交不可推断、字段作用域、
+  48 线程并发首次分配只产生 12 个映射且同原值取同别名、小码空间碰撞线性改派且
+  既有映射不变/空间用尽确定报错、查询期间换代不混入 gen2 半批（快照代次固定）、
+  换代后旧统计按保存代次复查逐组一致、停用后拒绝新查询/不分配新别名但历史可复查、
+  无授权/撤销 403、时间窗过滤、化名全套表不入证据包、JSON API（403/409）与页面冒烟。
 - `tests/test_rollout.py`：放量机制端到端验证（同键稳定/按比例分流/并发升档/
   冻结/撤销/复查复现/专项授权/HTTP 冒烟），`python3 -m unittest discover -s tests`。
 - `tests/test_approval_ttl.py`：扩权审批有效期与撤销端到端验证——永久授权（含旧库

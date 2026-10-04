@@ -1011,13 +1011,19 @@ def verify_bytes(file_bytes: bytes) -> dict:
         if fx.get("ruleset_id") and not rec_of("guard_rulesets", fx["ruleset_id"]):
             _err(errors, "guard_fixture_ruleset_missing",
                  f"评估 {fx_id} 固定的规则版本不在包内（历史检查无法重建）")
-    # 禁止表绝不允许出现在包对象里（防篡改夹带密文/凭据/授权/还原审计/阻断日志）
+    # 禁止表绝不允许出现在包对象里（防篡改夹带密文/凭据/授权/还原审计/阻断日志）。
+    # 化名域全套表同级禁止：别名是授权后的跨请求关联能力，只能留在原实例；去重
+    # HMAC（代次盐）、原值→别名映射、逐请求落点、聚合授权/任务/结果一旦导出即可
+    # 被离线关联/枚举，故任何查询结果、审计之外，证据包/下载文件一律不得携带。
     for forbidden in ("guard_secrets", "guard_credentials", "guard_reviewer_grants",
-                      "guard_reveals", "guard_block_log"):
+                      "guard_reveals", "guard_block_log",
+                      "alias_domains", "alias_generations", "alias_mappings",
+                      "guard_request_aliases", "alias_domain_grants",
+                      "alias_jobs", "alias_job_results"):
         present = [k[1] for k in by_key if k[0] == forbidden]
         if present:
             _err(errors, "guard_forbidden_table_leak",
-                 f"证据包含有禁止表 {forbidden} 的对象（密文/凭据/授权不得导出）："
+                 f"证据包含有禁止表 {forbidden} 的对象（密文/凭据/授权/化名域不得导出）："
                  f"{present[:3]}")
 
     # —— 窄范围选择集合精确性（防夹带）——

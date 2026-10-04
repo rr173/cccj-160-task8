@@ -155,8 +155,31 @@ def run() -> None:
                      "lang": "zh", "channel": "app"}, actor,
                     request_id="seed-guard-masked-01")
 
+    # 化名域演示：在遮盖之上开一个"客户关联域"（关联 customer_text），演示同一
+    # 被遮盖原值（手机号）跨请求得到同一随机别名、模型仍只见占位符；授权分析人
+    # analyst-wang 可在 /aliases 发起授权聚合。再造两条同号请求以便聚合页直接看到
+    # "同一别名、2 个请求"的关联结果。
+    from . import aliases
+    cust_domain = aliases.create_domain(
+        FAMILY, "客户关联域", ["customer_text"], actor,
+        description="跨请求关联同一客户的被遮盖联系方式（只用于授权质检聚合）",
+        alias_prefix="CUST")
+    aliases.grant_analyst(cust_domain["domain_id"], "analyst-wang", actor,
+                          "质检趋势分析（仅授权聚合，不接触原值）")
+    services.invoke(FAMILY,
+                    {"customer_text": "上次问题已解决，回访可打 13911112222",
+                     "lang": "zh", "channel": "web"}, actor,
+                    request_id="seed-alias-cust-01")
+    services.invoke(FAMILY,
+                    {"customer_text": "再次确认：13911112222 这个号能收到短信",
+                     "lang": "zh", "channel": "app"}, actor,
+                    request_id="seed-alias-cust-02")
+    aliases.create_aggregation_job(cust_domain["domain_id"], "analyst-wang", actor,
+                                   note="种子演示：客户跨请求关联统计")
+
     conn.commit()
     print("[seed] 演示数据就绪：family=%s 线上=v1，候选 v2（20%% 放量中，止损 3600s/"
           "n≥10/失败≤30%%，已入账 8 成功 2 失败）、v3（需工具权限审批）、"
           "v4（弱模型证据）；敏感隔离 v1（手机/邮箱替换、机密阻断，"
-          "复核人 auditor-li）" % FAMILY)
+          "复核人 auditor-li）；化名域『客户关联域』（分析人 analyst-wang，"
+          "已生成演示聚合任务）" % FAMILY)

@@ -166,6 +166,26 @@
 </div>
 {% endif %}
 
+{% if aliascard %}
+<div class="card">
+  <h2>化名域落点（仅域/代次/计数）</h2>
+  <div class="note">本请求的被遮盖原值已按下列化名域的<b>请求时代次</b>参与授权关联。
+    此处<b>不展示别名值</b>——跨请求别名关联只能由授权分析人在
+    <a href="/aliases">化名聚合</a>页查询；模型输入始终只有普通遮盖占位符。</div>
+  <table>
+    <thead><tr><th>化名域</th><th>固定代次</th><th>不同别名槽</th><th>总出现次数</th></tr></thead>
+    <tbody>
+    {% for a in aliascard %}
+      <tr><td class="small"><b>{{ a.domain_name }}</b><div class="small mono mut">{{ a.domain_id }}</div></td>
+        <td class="mono">gen {{ a.gen }}</td>
+        <td class="mono">{{ a.slots }}</td>
+        <td class="mono">{{ a.occurrences }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+
 {% if result %}
 <div class="card">
   <h2>重演报告</h2>

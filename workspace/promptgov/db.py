@@ -428,6 +428,133 @@ CREATE TABLE IF NOT EXISTS evidence_audit (
     created_at       TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- ============================================================ 化名域（Alias Domains）
+-- 在遮盖（mask）之上为**授权后的跨请求聚合**提供稳定关联：管理员把字段挂到某个
+-- 化名域后，被遮盖原值在域内按"代次（generation）"分配随机、不透明、不可离线
+-- 枚举的别名。同一原值在同一域同一代次内始终得到同一别名；不同域各自独立取盐，
+-- 别名之间不能相互推断。**模型输入永远只含普通遮盖占位符**，别名只用于聚合。
+-- 域支持换代（新数据用新代次，旧统计按保存的代次继续计算）与停用（停用后拒绝
+-- 新查询、不再为新请求分配别名，历史映射/任务/结果保留复查）。
+-- 下列任何表都**绝不进入证据包/下载文件**（与密文表同级禁止）。
+CREATE TABLE IF NOT EXISTS alias_domains (
+    domain_id        TEXT PRIMARY KEY,
+    family_id        TEXT NOT NULL REFERENCES families(family_id),
+    name             TEXT NOT NULL,
+    description      TEXT NOT NULL DEFAULT '',
+    fields_json      TEXT NOT NULL,            -- 关联的顶层字段名数组（如 ["customer_text"]）
+    status           TEXT NOT NULL DEFAULT 'active',  -- active / disabled
+    -- 别名码空间大小（每代次内可分配的不同别名数）；默认值对业务足够大，碰撞时
+    -- 在该空间内确定性线性改派。小空间（如 4）仅供碰撞处理验证。
+    alias_space      INTEGER NOT NULL DEFAULT 1048576,
+    -- 人类可读别名前缀（不含任何原值信息）；最终别名形如 {prefix}{base36码}
+    alias_prefix     TEXT NOT NULL DEFAULT 'A',
+    current_gen      INTEGER NOT NULL DEFAULT 1,  -- 当前代次号（换代 +1）
+    revoke_version   INTEGER NOT NULL DEFAULT 1,  -- 停用/配置并发控制版本号
+    created_by       TEXT NOT NULL DEFAULT 'api',
+    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    disabled_at      TEXT,
+    disabled_by      TEXT NOT NULL DEFAULT '',
+    UNIQUE(family_id, name)
+);
+
+-- 代次：换代后新数据使用新代次；旧映射与按旧代次保存的聚合结果永不重写。
+-- 每代次独立随机盐（gen_secret）：去重 HMAC 与首选槽位都由它键控，库外无法离线
+-- 枚举原值，也无法跨代次/跨域关联。盐只在本实例库内、只在分配/聚合时使用。
+CREATE TABLE IF NOT EXISTS alias_generations (
+    generation_id    TEXT PRIMARY KEY,
+    domain_id        TEXT NOT NULL REFERENCES alias_domains(domain_id),
+    gen              INTEGER NOT NULL,         -- 域内单调递增代次号（首发为 1）
+    gen_secret       TEXT NOT NULL,            -- 代次随机盐（hex），不出库、不进导出
+    status           TEXT NOT NULL DEFAULT 'active',  -- active / retired
+    note             TEXT NOT NULL DEFAULT '',
+    created_by       TEXT NOT NULL DEFAULT 'api',
+    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    retired_at       TEXT,
+    UNIQUE(domain_id, gen)
+);
+
+-- 原值 → 别名映射（域内、代次内唯一）。表内**没有原值明文**：只有以代次盐键控
+-- 的去重 HMAC（随机盐，库外不可枚举）与不透明别名码。别名随机取自该代次码空间，
+-- 首选槽位 = HMAC(代次盐, 原值) 对空间取模；碰撞（两原值同槽）按确定性线性探测
+-- 改派到下一个空闲码位——已存在映射永不因碰撞改变。
+CREATE TABLE IF NOT EXISTS alias_mappings (
+    mapping_id       TEXT PRIMARY KEY,
+    domain_id        TEXT NOT NULL REFERENCES alias_domains(domain_id),
+    generation_id    TEXT NOT NULL REFERENCES alias_generations(generation_id),
+    gen              INTEGER NOT NULL,
+    dedup_hmac       TEXT NOT NULL,            -- HMAC-SHA256(代次盐, 原值)，去重键（盐外不可枚举）
+    alias_code       INTEGER NOT NULL,         -- 代次内码位（0..alias_space-1）
+    alias_value      TEXT NOT NULL,            -- 对外别名（前缀 + base36 码），不含原值
+    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(domain_id, generation_id, dedup_hmac),
+    UNIQUE(domain_id, generation_id, alias_code)
+);
+
+-- 逐请求的化名落点：一次请求内某域某代次某别名出现的次数。别名只在这里与聚合中
+-- 出现；requests/遮盖映射/渲染提示/输出均不含别名，模型输入只含普通占位符。
+CREATE TABLE IF NOT EXISTS guard_request_aliases (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id       TEXT NOT NULL REFERENCES requests(request_id),
+    family_id        TEXT NOT NULL,
+    domain_id        TEXT NOT NULL REFERENCES alias_domains(domain_id),
+    generation_id    TEXT NOT NULL REFERENCES alias_generations(generation_id),
+    gen              INTEGER NOT NULL,         -- 请求固定的代次（请求开始时域的当前代次）
+    alias_code       INTEGER NOT NULL,
+    alias_value      TEXT NOT NULL,
+    occurrences      INTEGER NOT NULL DEFAULT 1,
+    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(request_id, domain_id, generation_id, alias_code)
+);
+
+-- 化名域聚合授权：哪些分析人可以对哪个域发起授权聚合查询（可撤销，CAS）。
+CREATE TABLE IF NOT EXISTS alias_domain_grants (
+    grant_id         TEXT PRIMARY KEY,
+    domain_id        TEXT NOT NULL REFERENCES alias_domains(domain_id),
+    reviewer         TEXT NOT NULL,
+    granted_by       TEXT NOT NULL,
+    revoke_version   INTEGER NOT NULL DEFAULT 1,
+    revoked_at       TEXT,
+    revoked_by       TEXT NOT NULL DEFAULT '',
+    reason           TEXT NOT NULL DEFAULT '',
+    created_at       TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- 聚合任务：创建即在只读快照事务内**固定查询开始时的代次集合**（该任务只统计
+-- 该代次及更早代次、且请求时间落在窗口内的数据）。执行期间换代不会混入半批新
+-- 别名——快照 read mark 之后提交的新代次数据对本任务不可见。
+CREATE TABLE IF NOT EXISTS alias_jobs (
+    job_id           TEXT PRIMARY KEY,
+    domain_id        TEXT NOT NULL REFERENCES alias_domains(domain_id),
+    family_id        TEXT NOT NULL,
+    created_by       TEXT NOT NULL,            -- 发起聚合的授权分析人
+    -- 固定的代次集合：{"domain_id","current_gen","generation_id","cutpoint":...}
+    gen_snapshot_json TEXT NOT NULL,
+    window_from      TEXT,                     -- 可选时间窗口（按请求产生时间）
+    window_until     TEXT,
+    status           TEXT NOT NULL DEFAULT 'completed',  -- completed（快照内同步完成）
+    group_count      INTEGER NOT NULL DEFAULT 0,
+    occurrence_total INTEGER NOT NULL DEFAULT 0,
+    request_total    INTEGER NOT NULL DEFAULT 0,
+    note             TEXT NOT NULL DEFAULT '',
+    created_at       TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- 聚合结果：按（任务固定代次集合内的各代次, 别名）分组。只有别名与计数，绝不含
+-- 原值、去重 HMAC 或任何可离线枚举原值的摘要。
+CREATE TABLE IF NOT EXISTS alias_job_results (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id           TEXT NOT NULL REFERENCES alias_jobs(job_id),
+    domain_id        TEXT NOT NULL,
+    gen              INTEGER NOT NULL,         -- 该分组按保存的代次计算
+    alias_value      TEXT NOT NULL,            -- 不透明别名（随机码，不含原值）
+    alias_code       INTEGER NOT NULL,
+    occurrence_count INTEGER NOT NULL,         -- 别名出现总次数
+    request_count    INTEGER NOT NULL,         -- 涉及的不同请求数
+    first_seen_at    TEXT NOT NULL,
+    last_seen_at     TEXT NOT NULL,
+    UNIQUE(job_id, gen, alias_code)
+);
+
 CREATE INDEX IF NOT EXISTS idx_versions_family ON versions(family_id);
 CREATE INDEX IF NOT EXISTS idx_eval_version ON eval_runs(version_id);
 CREATE INDEX IF NOT EXISTS idx_requests_version ON requests(version_id);
@@ -437,6 +564,16 @@ CREATE INDEX IF NOT EXISTS idx_windows_rollout ON stoploss_windows(rollout_id);
 CREATE INDEX IF NOT EXISTS idx_receipts_window ON feedback_receipts(window_id);
 CREATE INDEX IF NOT EXISTS idx_receipts_rollout ON feedback_receipts(rollout_id);
 CREATE INDEX IF NOT EXISTS idx_triggers_rollout ON stoploss_triggers(rollout_id);
+
+-- 化名域：聚合按 (域,代次) 扫描映射/落点，逐请求按 request_id 取落点
+CREATE INDEX IF NOT EXISTS idx_alias_mappings_domain_gen
+    ON alias_mappings(domain_id, gen);
+CREATE INDEX IF NOT EXISTS idx_request_aliases_domain_gen
+    ON guard_request_aliases(domain_id, gen);
+CREATE INDEX IF NOT EXISTS idx_request_aliases_request
+    ON guard_request_aliases(request_id);
+CREATE INDEX IF NOT EXISTS idx_alias_results_job ON alias_job_results(job_id);
+CREATE INDEX IF NOT EXISTS idx_alias_jobs_domain ON alias_jobs(domain_id);
 """
 
 # 老库增量迁移：requests 的放量证据列（新库已由 _SCHEMA 建全）

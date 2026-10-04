@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Any
 
-from . import config, core, guard, llm
+from . import aliases, config, core, guard, llm
 from .db import audit, get_conn, write_tx
 
 
@@ -1593,6 +1593,10 @@ def invoke(family_id: str, inputs: dict, actor: str, request_id: str | None = No
                     "content_hash": grs_row["content_hash"],
                     "rules": _loads(grs_row["rules_json"])} if grs_row else None)
 
+        # 固定本请求所用的化名域代次集合（随后换代不影响本请求：本请求只向读到
+        # 的代次落别名）。化名只在授权聚合中可见，模型输入仍只有普通遮盖占位符。
+        alias_ctx = aliases.active_context(c, family_id)
+
     errors = core.validate_against_contract(inputs, contract)
     if errors:
         raise DomainError("输入违反变量契约: " + "; ".join(errors))
@@ -1727,6 +1731,13 @@ def invoke(family_id: str, inputs: dict, actor: str, request_id: str | None = No
                  json.dumps(guard.storable_tokens(tokens), ensure_ascii=False),
                  json.dumps(actions, ensure_ascii=False, sort_keys=True),
                  json.dumps(output_actions, ensure_ascii=False)))
+        # 化名分配（同一最终写事务）：只在被遮盖原值上、按域固定代次落别名与
+        # 逐请求落点。别名不回写 requests/遮盖映射/提示/输出——模型输入只含普通
+        # 占位符，别名仅授权聚合任务可按域读取。
+        alias_summary = []
+        if grs and scan and scan["tokens"] and alias_ctx:
+            alias_summary = aliases.assign_for_request(
+                c, rid, family_id, scan["tokens"], alias_ctx, actor=actor)
         audit(actor, "invoke", "request", rid,
               f"family={family_id} version={hit_version_id} model={model_id} "
               f"input={inp_digest[:12]} output={out_digest[:12]}"
@@ -1748,6 +1759,7 @@ def invoke(family_id: str, inputs: dict, actor: str, request_id: str | None = No
                   "masked": len(scan["tokens"]) if grs and scan else 0,
                   "output_masked": output_masked_count,
                   "redacted": True if (grs and scan and scan["tokens"]) else False},
+        "alias_domains": alias_summary,
         "idempotent": False,
     }
 
@@ -1773,6 +1785,7 @@ def _idempotent_response(row) -> dict:
                    "output_masked": sum(a.get("masked", 0)
                                         for a in gv.get("output_actions", [])),
                    "redacted": True} if gv else None),
+        "alias_domains": aliases.request_alias_summary(d["request_id"]),
         "idempotent": True,
     }
 

@@ -1,0 +1,83 @@
+{% if flash %}<div class="flash">⚠ {{ flash }}</div>{% endif %}
+
+<div class="note">
+  <a href="/aliases?domain={{ domain.domain_id }}">← 返回授权聚合查询</a><br>
+  本任务在创建瞬间（<b>{{ job.cutpoint }}</b>）固定了化名域
+  <b>{{ domain.name }}</b> 的代次集合（≤ gen {{ snapshot_gen }}）。执行期间发生换代
+  不会影响本结果——新代次别名不混入；旧统计永远按保存的代次复查。结果只含
+  <b>随机、不透明别名与计数</b>，不含原值或可离线枚举的摘要，也不提供任何反查入口。
+</div>
+
+<div class="card">
+  <h2>任务 {{ job.job_id }}
+    {% if domain.status == "active" %}<span class="badge b-active">域 active</span>
+    {% else %}<span class="badge b-revoked">域已停用（历史结果保留复查）</span>{% endif %}
+  </h2>
+  <div class="kv">
+    <div>化名域</div><div>{{ domain.name }} <span class="chip mono small">{{ domain.domain_id }}</span></div>
+    <div>发起分析人</div><div>{{ job.created_by }}</div>
+    <div>状态 / 创建时刻</div><div>{{ job.status }} · {{ job.created_at }}</div>
+    <div>固定代次集合</div><div>
+      {% for g in snapshot_generations %}
+        <span class="chip">gen {{ g.gen }} · {{ g.status }}</span>
+      {% endfor %}
+    </div>
+    <div>时间窗口</div><div>[{{ job.window_from }}, {{ job.window_until }})（按请求产生时间）</div>
+    <div>分组 / 总出现 / 请求数</div>
+    <div class="mono">{{ job.group_count }} / {{ job.occurrence_total }} / {{ job.request_total }}</div>
+    <div>备注</div><div>{{ job.note }}</div>
+  </div>
+  <form method="post" action="/ui/alias-jobs/{{ job.job_id }}/review" class="row"
+        style="margin-top:12px">
+    <button class="ghost">按保存代次集合复查（重算比对）</button>
+  </form>
+</div>
+
+{% if review %}
+<div class="card" style="margin-top:16px">
+  <h2>历史统计复查（{{ review.reviewed_at }}）</h2>
+  {% if review.match %}
+  <p class="ok">✔ 按保存代次集合与时间窗在当前库重算，与落库结果<b>逐组一致</b>
+    （{{ review.recomputed_summary.groups }} 组，
+    {{ review.recomputed_summary.occurrences }} 次出现，
+    {{ review.recomputed_summary.requests }} 个请求）。换代后的新代次数据未参与。</p>
+  {% else %}
+  <p class="bad">✘ 重算与落库结果存在 {{ review.diffs | length }} 处差异：</p>
+  <table>
+    <thead><tr><th>代次</th><th>别名码</th><th>差异</th></tr></thead>
+    <tbody>
+    {% for d in review.diffs %}
+      <tr><td class="mono">gen {{ d.gen }}</td><td class="mono">{{ d.alias_code }}</td>
+        <td class="small">{{ d.kind }}
+          <div class="small mut">落库 {{ d.stored | tojson }} / 重算 {{ d.recomputed | tojson }}</div></td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</div>
+{% endif %}
+
+<div class="card" style="margin-top:16px">
+  <h2>聚合结果（别名 → 计数）</h2>
+  {% if has_results %}
+    {% for gg in gen_groups %}
+    <h3>代次 gen {{ gg.gen }}（{{ gg.count }} 个别名）</h3>
+    <table>
+      <thead><tr><th>别名</th><th>出现次数</th><th>涉及请求数</th><th>首次出现</th><th>最近出现</th></tr></thead>
+      <tbody>
+      {% for r in gg.rows %}
+        <tr>
+          <td class="mono"><b>{{ r.alias_value }}</b></td>
+          <td class="mono">{{ r.occurrence_count }}</td>
+          <td class="mono">{{ r.request_count }}</td>
+          <td class="small">{{ r.first_seen_at }}</td>
+          <td class="small">{{ r.last_seen_at }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% endfor %}
+  {% else %}
+  <p class="small mut">该窗口内没有任何别名落点。</p>
+  {% endif %}
+</div>

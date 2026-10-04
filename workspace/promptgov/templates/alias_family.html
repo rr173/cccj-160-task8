@@ -1,0 +1,137 @@
+{% if flash %}<div class="flash">⚠ {{ flash }}</div>{% endif %}
+
+<div class="note">
+  <a href="/families/{{ family.family_id }}">← 返回 {{ family.name }}</a> ·
+  <a href="/families/{{ family.family_id }}/guard">敏感隔离规则</a> ·
+  <a href="/aliases">授权聚合查询 →</a><br>
+  <b>化名域</b>在遮盖之上为<b>授权后的跨请求聚合</b>提供稳定关联：同一原值在同一域、
+  同一代次内始终得到同一随机别名；不同域各自独立取盐，别名之间不可相互推断。
+  <b>模型输入永远只用普通遮盖占位符</b>；别名只出现在授权聚合结果中，请求/审计/
+  证据包/下载文件都不含原值、别名或可离线枚举的摘要。
+  域支持<b>换代</b>（新数据用新代次，旧统计按保存代次继续计算）与<b>停用</b>
+  （停用后拒绝新查询，历史保留复查）。
+</div>
+
+<div class="card">
+  <h2>新建化名域（关联字段 → 域）</h2>
+  <form method="post" action="/ui/families/{{ family.family_id }}/alias-domains"
+        class="grid g3">
+    <div>
+      <label>域名（族内唯一）</label>
+      <input name="name" placeholder="如：客户关联域 / 工单关联域" required>
+    </div>
+    <div>
+      <label>关联顶层字段（逗号分隔；* = 全部被遮盖字段）</label>
+      <input name="fields" placeholder="customer_text" value="customer_text" required>
+    </div>
+    <div>
+      <label>别名前缀（1~8 位字母数字）</label>
+      <input name="alias_prefix" value="C" maxlength="8">
+    </div>
+    <div style="grid-column:1/-1">
+      <label>说明</label>
+      <input name="description" placeholder="用途/责任人（写入审计）">
+    </div>
+    <div class="small mut" style="grid-column:1/-1">
+      建议关联字段同时被某条 <b>mask 替换规则</b>覆盖——化名只分配给被遮盖的原值；
+      码空间默认 2²⁰（留空即可），碰撞在空间内确定性线性改派且不改动已有映射。
+    </div>
+    <div class="row" style="grid-column:1/-1"><button>创建域并开启第 1 代</button></div>
+  </form>
+</div>
+
+{% if not has_domains %}
+<div class="card" style="margin-top:16px"><p class="mut">该模板族还没有化名域。</p></div>
+{% endif %}
+
+{% for d in domains %}
+<div class="card" id="domain-{{ d.domain_id }}" style="margin-top:16px">
+  <h2>{{ d.name }}
+    {% if d.disabled %}<span class="badge b-revoked">已停用 · {{ d.disabled_at }}</span>
+    {% else %}<span class="badge b-active">active</span>{% endif %}
+    <span class="chip mono small">{{ d.domain_id }}</span></h2>
+  <div class="kv">
+    <div>关联字段</div><div>{{ d.fields_text }}</div>
+    <div>别名形态</div><div class="mono">{{ d.alias_prefix }} + base36 码（码空间 {{ d.alias_space }}）</div>
+    <div>当前代次</div><div><b>gen {{ d.current_gen }}</b></div>
+    <div>创建</div><div class="small">{{ d.created_at }} · {{ d.created_by }}</div>
+  </div>
+
+  <div class="grid g2" style="margin-top:12px">
+    <div>
+      <h3>代次（换代不重写旧映射/旧统计）</h3>
+      <table>
+        <thead><tr><th>代次</th><th>状态</th><th>已有不同别名</th><th>说明/时间</th></tr></thead>
+        <tbody>
+        {% for g in d.generations %}
+          <tr>
+            <td><b>gen {{ g.gen }}</b><div class="small mono mut">{{ g.generation_id }}</div></td>
+            <td>{% if g.status == "active" %}<span class="badge b-active">active</span>
+              {% else %}<span class="badge b-superseded">{{ g.status }}</span>{% endif %}</td>
+            <td class="mono">{{ g.mapping_count }}</td>
+            <td class="small">{{ g.note }}<div class="mut">{{ g.created_at }}{% if g.retired_at %} → {{ g.retired_at }}{% endif %}</div></td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      {% if not d.disabled %}
+      <form method="post" action="/ui/alias-domains/{{ d.domain_id }}/rotate"
+            class="row" style="margin-top:10px"
+            onsubmit="return confirm('换代后新请求使用新代次盐；旧统计按保存代次继续计算。确定换代？')">
+        <input type="hidden" name="expected_gen" value="{{ d.current_gen }}">
+        <input name="note" placeholder="换代原因（可选）" style="flex:1">
+        <button class="ghost">换代（gen {{ d.current_gen }} → {{ d.current_gen + 1 }}）</button>
+      </form>
+      {% else %}
+      <p class="small bad" style="margin-top:10px">域已停用：不再为新请求分配别名，新聚合查询被拒绝。</p>
+      {% endif %}
+    </div>
+
+    <div>
+      <h3>聚合授权分析人（可发起授权跨请求查询）</h3>
+      {% if not d.disabled %}
+      <form method="post" action="/ui/alias-domains/{{ d.domain_id }}/grants"
+            class="grid g3" style="grid-template-columns:1fr 1fr auto">
+        <input name="reviewer" placeholder="分析人标识，如 analyst-wang" required>
+        <input name="reason" placeholder="授权理由">
+        <button>授权</button>
+      </form>
+      {% endif %}
+      <table style="margin-top:8px">
+        <thead><tr><th>分析人</th><th>授权人</th><th>状态</th><th>版本号</th><th></th></tr></thead>
+        <tbody>
+        {% for g in d.grants %}
+          <tr>
+            <td class="small"><b>{{ g.reviewer }}</b><div class="small mut">{{ g.reason }}</div></td>
+            <td class="small">{{ g.granted_by }}</td>
+            <td>{% if g.revoked %}<span class="badge b-revoked">已撤销 · {{ g.revoked_at }}</span>
+              {% else %}<span class="badge b-active">有效</span>{% endif %}</td>
+            <td class="small mono">v{{ g.revoke_version }}</td>
+            <td>{% if not g.revoked %}
+              <form method="post" action="/ui/alias-grants/{{ g.grant_id }}/revoke"
+                    style="display:flex;gap:4px">
+                <input type="hidden" name="expected_version" value="{{ g.revoke_version }}">
+                <button class="danger" style="padding:4px 8px">撤销</button>
+              </form>{% endif %}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      <p class="small" style="margin-top:8px">
+        <a href="/aliases?domain={{ d.domain_id }}">前往该域授权聚合查询 →</a>
+      </p>
+      {% if not d.disabled %}
+      <form method="post" action="/ui/alias-domains/{{ d.domain_id }}/disable"
+            style="margin-top:10px"
+            onsubmit="return confirm('停用为终态：新聚合查询将被拒绝、新请求不再分配别名（历史保留）。确定停用？')">
+        <input type="hidden" name="expected_version" value="{{ d.revoke_version }}">
+        <div class="row">
+          <input name="reason" placeholder="停用原因（可选）" style="flex:1">
+          <button class="danger">停用此域</button>
+        </div>
+      </form>
+      {% endif %}
+    </div>
+  </div>
+</div>
+{% endfor %}
